@@ -1,0 +1,26 @@
+{
+  "SGP_PKL": {
+    "no2_mean": 0.0,
+    "no2_std": 1e-05,
+    "consecutive_warn": 0,
+    "last_badge": null,
+    "last_run_at": null,
+    "audit_log": []
+  },
+  "PVG_DXB_AMS": {
+    "no2_mean": 0.0,
+    "no2_std": 1e-05,
+    "consecutive_warn": 0,
+    "last_badge": null,
+    "last_run_at": null,
+    "audit_log": []
+  },
+  "NYNJ_SAV": {
+    "no2_mean": 0.0,
+    "no2_std": 1e-05,
+    "consecutive_warn": 0,
+    "last_badge": null,
+    "last_run_at": null,
+    "audit_log": []
+  }
+}

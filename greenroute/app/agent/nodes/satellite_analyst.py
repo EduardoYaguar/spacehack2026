@@ -42,6 +42,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 
+from app.agent.payload_registry import list_payloads, resolve_payload, resolve_payload_fallback
 from app.agent.state import AgentState
 from app.agent.tools.satellite_tools import (
     query_aod,
@@ -63,17 +64,29 @@ from app.models import Badge, SatelliteReport, TransportMode
 # Grid path resolution
 # ---------------------------------------------------------------------------
 
-def _resolve_grid_path(corridor_cfg: CorridorCfg) -> str:
-    """Return the absolute path of the first available grid file for the corridor."""
-    workspace = Path(__file__).resolve().parents[4]   # spacehack2026/
-    for rel_path in corridor_cfg.grid_paths:
-        candidate = workspace / rel_path
-        if candidate.exists():
-            return str(candidate)
-    raise FileNotFoundError(
-        f"No grid file found for corridor '{corridor_cfg.corridor_id}'. "
-        f"Searched: {corridor_cfg.grid_paths}"
-    )
+def _resolve_grid_path(corridor_cfg: CorridorCfg, window: str | None = None) -> str:
+    """
+    Return the absolute path to the satellite grid JSON for a corridor.
+
+    Uses the PayloadRegistry as the single source of truth.
+    Resolution order:
+      1. If `window` is specified → use that exact snapshot (e.g. "P2", "latest-1").
+      2. If `window` is None → use the default (most recent) snapshot for the corridor.
+      3. If the default snapshot is missing → fall back through all windows newest-first.
+
+    Raises FileNotFoundError when no snapshot exists for the corridor at all.
+    """
+    corridor_id = corridor_cfg.corridor_id
+    if window:
+        # Explicit window requested — honour it, let the registry raise if unknown.
+        return resolve_payload(corridor_id, window=window)
+
+    try:
+        # Default: most recent snapshot (P1 or "latest")
+        return resolve_payload(corridor_id)
+    except FileNotFoundError:
+        # Primary snapshot missing — fall back to the first available window.
+        return resolve_payload_fallback(corridor_id)
 
 
 # ---------------------------------------------------------------------------
@@ -313,10 +326,13 @@ def satellite_analyst_node(state: AgentState) -> dict:
     """
     LangGraph node: SatelliteAnalyst.
 
-    Resolves the grid path, validates payload mode against corridor config,
-    builds a ReAct agent with all satellite tools, invokes it (max 5–9 tool
-    calls depending on mode), parses the SatelliteReport from the agent's last
-    message, and returns a state update.
+    Resolves the grid path via PayloadRegistry, validates payload mode against
+    the corridor config, builds a ReAct agent with all satellite tools, invokes
+    it (max 5–9 tool calls depending on mode), parses the SatelliteReport from
+    the agent's last message, and returns a state update.
+
+    The temporal window is read from state["temporal_window"] when present
+    (e.g. "P2" or "latest-1").  If absent, the most recent snapshot is used.
 
     Key outputs written to AgentState:
       - messages            : accumulated LangGraph message history
@@ -327,8 +343,10 @@ def satellite_analyst_node(state: AgentState) -> dict:
     settings = get_settings()
     corridor_cfg = get_corridor_config(state["corridor_id"])
 
-    # 1. Resolve grid path
-    grid_path = _resolve_grid_path(corridor_cfg)
+    # 1. Resolve grid path via PayloadRegistry.
+    #    Optionally honour a temporal window from state (e.g. "P2", "latest-1").
+    window: str | None = state.get("temporal_window")  # type: ignore[attr-defined]
+    grid_path = _resolve_grid_path(corridor_cfg, window=window)
 
     # 2. Pre-compute green_score stats (avoids burning a tool call for context).
     #    Also returns payload_mode (the `mode` field from the JSON top-level).

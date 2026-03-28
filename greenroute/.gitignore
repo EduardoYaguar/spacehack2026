@@ -1,3 +1,22 @@
+# ── Secrets — NEVER commit these ─────────────────────────────────────────────
 .env
-.env.example
-.claude
+gee_service_account.json
+firebase_service_account.json
+
+# ── Python ────────────────────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+
+# ── Claude Code local settings ───────────────────────────────────────────────
+.claude/

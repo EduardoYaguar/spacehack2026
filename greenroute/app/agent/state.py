@@ -25,8 +25,14 @@ class AgentState(TypedDict):
     vehicle_track: Optional[list[dict]] # AIS/ADS-B position records
     vehicle_id: Optional[str]           # IMO number (maritime) or ICAO hex (aviation)
 
+    # Optional temporal window override for PayloadRegistry
+    # maritime: "latest" | "latest-1" | "latest-2"
+    # aviation / trucking: "P1" | "P2" | "P3"
+    # When None, the most recent snapshot is used automatically.
+    temporal_window: Optional[str]
+
     # ── Resolved at runtime by satellite_analyst_node ─────────────────────────
-    grid_snapshot_path: str             # absolute path to the grid JSON file used
+    grid_snapshot_path: Optional[str]   # absolute path to the grid JSON file used
 
     # ── Agent outputs (set sequentially, read by downstream agents) ───────────
     satellite_report: Optional[dict]        # SatelliteReport  serialised to dict
