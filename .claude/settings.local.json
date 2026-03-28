@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(find /home/eduardoyaguar/PycharmProjects/spacehack2026 -maxdepth 3 -type f -not -path */__pycache__/* -not -path *.pyc)",
+      "Bash(uv run:*)",
+      "Bash(uv sync:*)"
     ]
   }
 }
