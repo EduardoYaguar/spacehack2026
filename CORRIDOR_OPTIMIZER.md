@@ -2,7 +2,7 @@
 
 > Finds the lowest-carbon route through a satellite grid using A* pathfinding.
 > Part of the **GreenRoute Intelligence Platform**.
-> Supports maritime (SGP ↔ PKL) and aviation (PVG → DXB → AMS) corridors.
+> Supports maritime (SGP ↔ PKL), aviation (PVG → DXB → AMS), and terrestrial trucking (Port NY/NJ → Port of Savannah) corridors.
 
 ---
 
@@ -136,6 +136,38 @@ jet-stream and high-turbulence regions. A green_score of ~45 is expected — not
 
 ---
 
+## Terrestrial / Trucking mode
+
+**Corridor:** Port NY/NJ (Newark) → Port of Savannah
+
+**Grid:** 200 rows × 180 cols, 0.05°/cell (~5.6 km), N 41.5 / S 31.5 / W -82.5 / E -73.5
+
+**Navigability:** road cells only — derived from TIGER/2016 road network (interstates + US highways, 5 km buffer). Stored in top-level `road_mask` key (1.0 = road, 0.0 = non-road).
+
+**Layers contributing to green_score** (pre-computed in `derived_layers`):
+
+| Layer | Weight | Description |
+|---|---|---|
+| NO2 | 0.20 | Tropospheric nitrogen dioxide — traffic emissions |
+| Slope | 0.20 | Terrain slope (degrees) — fuel consumption proxy |
+| Congestion | 0.20 | VIIRS night-light — road traffic density |
+| CO | 0.10 | Carbon monoxide — combustion completeness |
+| Precipitation | 0.08 | Precip rate (mm/hr) — road condition |
+| Snow cover | 0.07 | Snow coverage (%) — road condition |
+| SO2 | 0.05 | Sulfur dioxide |
+| Wind | 0.05 | Surface wind speed — aerodynamic drag |
+| AOD | 0.05 | Aerosol optical depth — air quality |
+
+**green_score location in JSON:** `derived_layers.green_score` (NOT `layers`)
+
+**Mandatory waypoints:** none — direct Port NY/NJ → Port of Savannah
+
+**Typical scores:** Mostly GREEN (≥65). The US East Coast I-95 corridor is well-maintained and relatively clean.
+
+**Time windows available:** P1, P2, P3 — three snapshots in `terrestre_usa/`
+
+---
+
 ## How it works
 
 ### 1. Grid input
@@ -144,9 +176,10 @@ The optimizer receives a GEE JSON snapshot. Each snapshot has the same schema bu
 different values (satellite data updates by time window). The file contains:
 
 - **`grid_definition`** — bounding box, cell count, cell size
-- **`land_mask`** — 2D matrix for maritime; string `"none"` for aviation
+- **`land_mask`** — 2D matrix for maritime (1.0 = water); absent for aviation/trucking
+- **`road_mask`** — 2D matrix for trucking (1.0 = road cell); absent for maritime/aviation
 - **`layers`** — per-cell values for mode-specific atmospheric layers
-- **`derived_layers`** — aviation only: `green_score`, `turbulence_index`, `contrail_risk`, `wind_speed_250hpa_ms`
+- **`derived_layers`** — aviation and trucking: `green_score` + mode-specific derived fields
 - **`corridoriq_config`** — weights used to compute green_score
 
 ### 2. Graph construction (`build_graph`)
@@ -154,16 +187,17 @@ different values (satellite data updates by time window). The file contains:
 - One **node** per navigable cell
 - **8-connected directed edges** to all navigable neighbours (including diagonals)
 - Edge weight = `destination_cost * (1 - dist_weight) + normalised_haversine * dist_weight`
-  (90% environmental cost, 10% distance penalty for maritime; ratios come from JSON config)
-- Mode-aware: maritime = water only, aviation = all cells, land = land only
+  (90% environmental cost, 10% distance penalty; ratios come from JSON config)
+- Mode-aware: maritime = water only, aviation = all cells, trucking = road cells only
 
 ### 3. A* pathfinding (`run_astar`)
 
 Segmented through mandatory waypoints:
 
 ```
-Maritime:  Port Klang  ->  One Fathom Bank  ->  Raffles Lighthouse TSS  ->  Port of Singapore
-Aviation:  PVG  ->  Dubai Intl (DXB)  ->  AMS
+Maritime:   Port Klang  ->  One Fathom Bank  ->  Raffles Lighthouse TSS  ->  Port of Singapore
+Aviation:   PVG  ->  Dubai Intl (DXB)  ->  AMS
+Trucking:   Port NY/NJ  ->  Port of Savannah  (no intermediate waypoints)
 ```
 
 Each segment runs a separate A* with haversine heuristic (admissible).
@@ -220,6 +254,10 @@ spacehack2026/
 ├── latest/maritime_portklang_singapore.json    <- maritime grid (latest)
 ├── latest-1/maritime_portklang_singapore.json
 ├── latest-2/maritime_portklang_singapore.json
+├── terrestre_usa/
+│   ├── p1/terrestrial_usa_p1.json   <- trucking grid, window P1
+│   ├── p2/terrestrial_usa_p2.json   <- trucking grid, window P2
+│   └── p3/terrestrial_usa_p3.json   <- trucking grid, window P3
 └── greenroute/
     ├── app/agent/
     │   ├── nodes/corridor_optimizer.py   <- LLM ReAct agent (max 5 tool calls)
@@ -250,8 +288,15 @@ python greenroute/scripts/test_optimizer.py --aviation
 # Aviation — all three windows (p1/p2/p3)
 python greenroute/scripts/test_optimizer.py --aviation --all
 
+# Terrestrial (trucking) — latest snapshot (p1)
+python greenroute/scripts/test_optimizer.py --terrestrial
+
+# Terrestrial — all three windows (p1/p2/p3)
+python greenroute/scripts/test_optimizer.py --terrestrial --all
+
 # Any specific JSON
 python greenroute/scripts/test_optimizer.py aereo/p2/aviation_payload_p2.json
+python greenroute/scripts/test_optimizer.py terrestre_usa/p2/terrestrial_usa_p2.json
 ```
 
 Expected output (maritime, abbreviated):
@@ -321,22 +366,29 @@ python greenroute/scripts/visualize_route.py --aviation
 # Aviation -- all three windows (p1/p2/p3)
 python greenroute/scripts/visualize_route.py --aviation --all
 
+# Terrestrial (trucking) -- latest snapshot (p1)
+python greenroute/scripts/visualize_route.py --terrestrial
+
+# Terrestrial -- all three windows (p1/p2/p3)
+python greenroute/scripts/visualize_route.py --terrestrial --all
+
 # Any specific JSON
 python greenroute/scripts/visualize_route.py aereo/p2/aviation_payload_p2.json
+python greenroute/scripts/visualize_route.py terrestre_usa/p2/terrestrial_usa_p2.json
 
 # Custom output path (single target only)
 python greenroute/scripts/visualize_route.py latest/maritime_portklang_singapore.json --out output/route.png
 ```
 
 Output files are saved as `map_route_optimal.png` next to the input JSON
-(e.g. `aereo/p1/map_route_optimal.png`).
+(e.g. `terrestre_usa/p1/map_route_optimal.png`).
 
 The PNG shows:
 - Green score heatmap as background (same colormap as the GEE layer maps)
 - White route line with cyan glow
-- Cyan diamond markers at mandatory waypoints
+- Cyan diamond markers at mandatory waypoints (maritime/aviation only)
 - Stats box: green score, vs-baseline %, distance, badge distribution
-- Maritime: land fill + coastline overlay; Aviation: full-grid heatmap (no land mask)
+- Maritime: land fill + coastline overlay; Aviation: full-grid heatmap; Trucking: non-road background fill
 
 ### Full LLM agent test (requires ANTHROPIC_API_KEY)
 

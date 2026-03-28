@@ -150,7 +150,10 @@ Your task: find the greenest route through the satellite grid using A* and
 return a RouteRecommendation JSON.
 
 The decisive metric is green_score (0-100, higher = greener). It is a
-composite already computed from NO2, SO2, wind, wave height, and VIIRS traffic.
+composite already computed from mode-specific layers:
+  maritime  — NO2, SO2, wind, wave height, VIIRS traffic
+  aviation  — wind 250hPa, turbulence, contrail risk, NO2, CO, cloud top, aerosol
+  trucking  — NO2, SO2, CO, slope, congestion, wind, precipitation, snow, AOD
 A* minimises cost = 100 - green_score. You do not reason about individual
 layers — green_score is the single source of truth for path quality.
 

@@ -3,11 +3,13 @@ test_optimizer.py -- Smoke-test the CorridorOptimizer tools WITHOUT the LLM.
 
 Run from the workspace root (spacehack2026/):
 
-    python greenroute/scripts/test_optimizer.py                   # maritime latest
-    python greenroute/scripts/test_optimizer.py --all             # all maritime snapshots
-    python greenroute/scripts/test_optimizer.py --aviation        # aviation latest (p1)
-    python greenroute/scripts/test_optimizer.py --aviation --all  # all aviation snapshots (p1/p2/p3)
-    python greenroute/scripts/test_optimizer.py <path/to/file.json>  # any specific snapshot
+    python greenroute/scripts/test_optimizer.py                        # maritime latest
+    python greenroute/scripts/test_optimizer.py --all                  # all maritime snapshots
+    python greenroute/scripts/test_optimizer.py --aviation             # aviation latest (p1)
+    python greenroute/scripts/test_optimizer.py --aviation --all       # all aviation snapshots (p1/p2/p3)
+    python greenroute/scripts/test_optimizer.py --terrestrial          # trucking latest (p1)
+    python greenroute/scripts/test_optimizer.py --terrestrial --all    # all trucking snapshots (p1/p2/p3)
+    python greenroute/scripts/test_optimizer.py <path/to/file.json>    # any specific snapshot
 
 No API key required -- this tests the Python tools only.
 """
@@ -38,6 +40,12 @@ AVIATION_SNAPSHOTS = [
     "aereo/p1/aviation_payload_p1.json",
     "aereo/p2/aviation_payload_p2.json",
     "aereo/p3/aviation_payload_p3.json",
+]
+
+TERRESTRIAL_SNAPSHOTS = [
+    "terrestre_usa/p1/terrestrial_usa_p1.json",
+    "terrestre_usa/p2/terrestrial_usa_p2.json",
+    "terrestre_usa/p3/terrestrial_usa_p3.json",
 ]
 
 SEP = "-" * 60
@@ -151,8 +159,9 @@ def _print_summary(results: list[tuple[str, dict]]) -> None:
 def main():
     args = sys.argv[1:]
 
-    aviation_mode = "--aviation" in args
-    run_all       = "--all" in args
+    aviation_mode     = "--aviation" in args
+    terrestrial_mode  = "--terrestrial" in args
+    run_all           = "--all" in args
 
     # Strip flags from args to get remaining positional file paths
     positional = [a for a in args if not a.startswith("--")]
@@ -160,9 +169,19 @@ def main():
     if positional:
         targets = positional
     elif run_all:
-        targets = AVIATION_SNAPSHOTS if aviation_mode else MARITIME_SNAPSHOTS
+        if terrestrial_mode:
+            targets = TERRESTRIAL_SNAPSHOTS
+        elif aviation_mode:
+            targets = AVIATION_SNAPSHOTS
+        else:
+            targets = MARITIME_SNAPSHOTS
     else:
-        targets = [AVIATION_SNAPSHOTS[0] if aviation_mode else MARITIME_SNAPSHOTS[0]]
+        if terrestrial_mode:
+            targets = [TERRESTRIAL_SNAPSHOTS[0]]
+        elif aviation_mode:
+            targets = [AVIATION_SNAPSHOTS[0]]
+        else:
+            targets = [MARITIME_SNAPSHOTS[0]]
 
     results = []
     for snap in targets:

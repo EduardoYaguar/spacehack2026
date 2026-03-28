@@ -12,7 +12,7 @@ wind, wave height, and VIIRS traffic according to the mode's config.
 The individual layer values are stored on nodes for informational output only.
 
 Design notes:
-  - Mode (maritime / aviation / land) is read from the grid JSON.
+  - Mode (maritime / aviation / trucking) is read from the grid JSON.
   - Weights and normalization come from corridoriq_config inside the JSON.
   - Graph and last-computed path are cached at module level across the three
     tool calls within a single agent run; reset on each build_graph call.
@@ -38,7 +38,6 @@ _checkpoints: list[tuple[int, int]] | None = None     # [origin, wp1…wpN, dest
 
 # ---------------------------------------------------------------------------
 # Mandatory waypoints per mode  (PKL → SGP direction, matching JSON origin/dest)
-# Aviation and land entries will be added when those JSONs arrive.
 # ---------------------------------------------------------------------------
 _DEFAULT_WAYPOINTS: dict[str, list[dict]] = {
     "maritime": [
@@ -48,20 +47,23 @@ _DEFAULT_WAYPOINTS: dict[str, list[dict]] = {
     "aviation": [
         {"name": "Dubai Intl (DXB)", "lat": 25.25, "lon": 55.36},
     ],
+    "trucking": [],   # Port NY/NJ → Port of Savannah, no intermediate chokepoints
     "land": [],
 }
 
 # ---------------------------------------------------------------------------
 # Navigability rule per mode
 # ---------------------------------------------------------------------------
-def _is_navigable(land_value: float, mode: str) -> bool:
+def _is_navigable(mask_value: float, mode: str) -> bool:
     if mode == "maritime":
-        return land_value == 1.0
+        return mask_value == 1.0   # water cells
     if mode == "aviation":
-        return True          # planes fly over everything
+        return True                # planes fly over everything
+    if mode == "trucking":
+        return mask_value == 1.0   # road cells (road_mask == 1)
     if mode == "land":
-        return land_value == 0.0
-    return land_value == 1.0  # safe default
+        return mask_value == 0.0   # legacy: land_mask == 0 means passable land
+    return mask_value == 1.0       # safe default
 
 
 # ---------------------------------------------------------------------------
@@ -198,14 +200,20 @@ def build_graph(
     layers  = raw["layers"]
     cfg     = raw.get("corridoriq_config", {})
 
-    # Aviation stores green_score and derived met fields in a separate top-level key.
+    # Aviation and trucking store green_score in derived_layers.
     # Maritime stores green_score directly in layers.
     derived_layers = raw.get("derived_layers", {})
 
-    # Land mask: aviation has no matrix — every cell is navigable.
-    land_mask_raw = gdef.get("land_mask", raw.get("land_mask", {}))
-    has_land_mask = isinstance(land_mask_raw, dict) and "data" in land_mask_raw
-    land_mask_data = land_mask_raw["data"] if has_land_mask else None
+    # Navigability mask:
+    #   maritime  → land_mask (in gdef or raw top-level), 1.0 = water
+    #   trucking  → road_mask (raw top-level), 1.0 = road cell
+    #   aviation  → no mask; every cell is navigable
+    if mode == "trucking":
+        mask_raw = raw.get("road_mask", {})
+    else:
+        mask_raw = gdef.get("land_mask", raw.get("land_mask", {}))
+    has_mask = isinstance(mask_raw, dict) and "data" in mask_raw
+    mask_data = mask_raw["data"] if has_mask else None
 
     rows = gdef["rows"]
     cols = gdef["cols"]
@@ -220,8 +228,8 @@ def build_graph(
     for r in range(rows):
         for c in range(cols):
             # Navigability check
-            if land_mask_data is not None:
-                if not _is_navigable(land_mask_data[r][c], mode):
+            if mask_data is not None:
+                if not _is_navigable(mask_data[r][c], mode):
                     continue
             # else: aviation — all cells navigable
 
@@ -265,6 +273,16 @@ def build_graph(
                 attrs["turbulence_index"]      = derived_layers.get("turbulence_index", {}).get("data", [[None]*cols]*rows)[r][c]
                 attrs["contrail_risk"]         = derived_layers.get("contrail_risk", {}).get("data", [[None]*cols]*rows)[r][c]
                 attrs["wind_speed_250hpa_ms"]  = derived_layers.get("wind_speed_250hpa_ms", {}).get("data", [[None]*cols]*rows)[r][c]
+
+            elif mode == "trucking":
+                # Trucking-specific layers (informational; green_score already in derived_layers)
+                attrs["no2_mol_m2"]  = layers["no2_mol_m2"]["data"][r][c]
+                attrs["so2_mol_m2"]  = layers["so2_mol_m2"]["data"][r][c]
+                attrs["co_mol_m2"]   = layers["co_mol_m2"]["data"][r][c]
+                attrs["precip_mm"]   = layers["precip_mm"]["data"][r][c]
+                attrs["snow_cover"]  = layers["snow_cover"]["data"][r][c]
+                attrs["aod"]         = layers["aod"]["data"][r][c]
+                attrs["viirs_nw"]    = layers["viirs_nw"]["data"][r][c]  # congestion proxy
 
             attrs["cost"] = _cell_cost(attrs, cfg, mode)
             G.add_node((r, c), **attrs)
@@ -511,6 +529,13 @@ def score_path() -> dict:
             _accum("turbulence_index",      node.get("turbulence_index"))
             _accum("contrail_risk",         node.get("contrail_risk"))
             _accum("wind_speed_250hpa_ms",  node.get("wind_speed_250hpa_ms"))
+        elif mode == "trucking":
+            _accum("so2_mol_m2",  node.get("so2_mol_m2"))
+            _accum("co_mol_m2",   node.get("co_mol_m2"))
+            _accum("precip_mm",   node.get("precip_mm"))
+            _accum("snow_cover",  node.get("snow_cover"))
+            _accum("aod",         node.get("aod"))
+            _accum("viirs_nw",    node.get("viirs_nw"))
 
     def _mean(lst: list[float]) -> float:
         return round(sum(lst) / len(lst), 6) if lst else 0.0

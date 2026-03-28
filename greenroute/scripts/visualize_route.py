@@ -18,6 +18,12 @@ Usage (run from workspace root, spacehack2026/):
     # Aviation -- all three windows (p1/p2/p3)
     python greenroute/scripts/visualize_route.py --aviation --all
 
+    # Terrestrial (trucking) -- latest snapshot (p1)
+    python greenroute/scripts/visualize_route.py --terrestrial
+
+    # Terrestrial -- all three windows (p1/p2/p3)
+    python greenroute/scripts/visualize_route.py --terrestrial --all
+
     # Any specific JSON
     python greenroute/scripts/visualize_route.py aereo/p2/aviation_payload_p2.json
 
@@ -123,12 +129,19 @@ def render_route(grid_path: str, output_path: str | None = None) -> Path:
     west  = gdef["bounds"]["west"]
     east  = gdef["bounds"]["east"]
 
-    # -- Detect land mask availability -----------------------------------------
-    # Maritime: land_mask is a top-level key with {"data": [[...]]}
-    # Aviation: land_mask field is a descriptive string -- no matrix
-    lm_raw = gdef.get("land_mask", grid.get("land_mask", {}))
-    has_land_mask = isinstance(lm_raw, dict) and "data" in lm_raw
-    land_mask_data = lm_raw["data"] if has_land_mask else None
+    # -- Detect navigability mask ----------------------------------------------
+    # maritime  → land_mask (in gdef or raw top-level), 1.0 = water cell
+    # trucking  → road_mask (raw top-level), 1.0 = road cell
+    # aviation  → no mask matrix; every cell is navigable
+    if mode == "trucking":
+        mask_raw = grid.get("road_mask", {})
+    else:
+        mask_raw = gdef.get("land_mask", grid.get("land_mask", {}))
+    has_mask = isinstance(mask_raw, dict) and "data" in mask_raw
+    mask_data = mask_raw["data"] if has_mask else None
+    # Keep legacy name for code below that references it for land/road rendering
+    has_land_mask = has_mask
+    land_mask_data = mask_data
 
     # -- green_score source: derived_layers (aviation) or layers (maritime) ----
     layers         = grid["layers"]
@@ -167,9 +180,11 @@ def render_route(grid_path: str, output_path: str | None = None) -> Path:
     # -- Figure dimensions: wider for aviation's 125-degree grid ---------------
     lon_span = east - west
     lat_span = north - south
-    if lon_span > 30:   # aviation
+    if lon_span > 30:       # aviation
         fig_w, fig_h = 18, 8
-    else:               # maritime (narrow corridor)
+    elif mode == "trucking":  # US east coast corridor — portrait orientation
+        fig_w, fig_h = 8, 11
+    else:                   # maritime (narrow corridor)
         fig_w, fig_h = 10, 8
 
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor=BG_COLOR)
@@ -193,8 +208,8 @@ def render_route(grid_path: str, output_path: str | None = None) -> Path:
         shading="flat", alpha=0.85, rasterized=True, zorder=2,
     )
 
-    # -- Layer 3: coastline (maritime only -- too slow and meaningless for aviation)
-    if has_land_mask:
+    # -- Layer 3: coastline (maritime only -- too slow/meaningless for aviation/trucking)
+    if has_land_mask and mode == "maritime":
         for r in range(rows):
             for c in range(cols):
                 if land_mask_data[r][c] != 1.0:
@@ -298,13 +313,17 @@ def render_route(grid_path: str, output_path: str | None = None) -> Path:
     ax.set_ylim(south, north)
     ax.set_aspect("equal")
 
-    # Tick interval: coarse for wide aviation grid, fine for maritime
-    lon_tick = 10.0 if lon_span > 30 else 1.0
-    lat_tick = 5.0  if lat_span > 20 else 0.5
+    # Tick interval: coarse for wide aviation grid, fine for maritime/trucking
+    lon_tick = 10.0 if lon_span > 30 else 2.0 if mode == "trucking" else 1.0
+    lat_tick = 5.0  if lat_span > 20 else 2.0 if mode == "trucking" else 0.5
     ax.xaxis.set_major_locator(mticker.MultipleLocator(lon_tick))
     ax.yaxis.set_major_locator(mticker.MultipleLocator(lat_tick))
-    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0f}E"))
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda y, _: f"{y:.0f}N"))
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(
+        lambda x, _: f"{abs(x):.0f}{'W' if x < 0 else 'E'}"
+    ))
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(
+        lambda y, _: f"{abs(y):.0f}{'S' if y < 0 else 'N'}"
+    ))
     ax.tick_params(colors=DIM_TEXT, labelsize=7.5, length=3)
     for spine in ax.spines.values():
         spine.set_edgecolor(COAST_COLOR)
@@ -366,9 +385,14 @@ def render_route(grid_path: str, output_path: str | None = None) -> Path:
     except Exception:
         snap_label = snap_ts
 
-    # Include time window label (P1/P2/P3) for aviation
+    # Include time window label (P1/P2/P3) for aviation and trucking
     window = grid.get("window", {})
-    mode_label = "Aviation" if mode == "aviation" else "Maritime"
+    if mode == "aviation":
+        mode_label = "Aviation"
+    elif mode == "trucking":
+        mode_label = "Trucking"
+    else:
+        mode_label = "Maritime"
     if window:
         win_label  = window.get("label", "")
         win_start  = window.get("start", "")
@@ -422,6 +446,12 @@ AVIATION_SNAPSHOTS = [
     "aereo/p3/aviation_payload_p3.json",
 ]
 
+TERRESTRIAL_SNAPSHOTS = [
+    "terrestre_usa/p1/terrestrial_usa_p1.json",
+    "terrestre_usa/p2/terrestrial_usa_p2.json",
+    "terrestre_usa/p3/terrestrial_usa_p3.json",
+]
+
 
 def main():
     args = sys.argv[1:]
@@ -432,16 +462,27 @@ def main():
         out_path = args[idx + 1]
         args = [a for i, a in enumerate(args) if i not in (idx, idx + 1)]
 
-    aviation_mode = "--aviation" in args
-    run_all       = "--all" in args
-    positional    = [a for a in args if not a.startswith("--")]
+    aviation_mode     = "--aviation" in args
+    terrestrial_mode  = "--terrestrial" in args
+    run_all           = "--all" in args
+    positional        = [a for a in args if not a.startswith("--")]
 
     if positional:
         targets = positional
     elif run_all:
-        targets = AVIATION_SNAPSHOTS if aviation_mode else MARITIME_SNAPSHOTS
+        if terrestrial_mode:
+            targets = TERRESTRIAL_SNAPSHOTS
+        elif aviation_mode:
+            targets = AVIATION_SNAPSHOTS
+        else:
+            targets = MARITIME_SNAPSHOTS
     else:
-        targets = [AVIATION_SNAPSHOTS[0] if aviation_mode else MARITIME_SNAPSHOTS[0]]
+        if terrestrial_mode:
+            targets = [TERRESTRIAL_SNAPSHOTS[0]]
+        elif aviation_mode:
+            targets = [AVIATION_SNAPSHOTS[0]]
+        else:
+            targets = [MARITIME_SNAPSHOTS[0]]
 
     for snap in targets:
         print(f"\nRendering route for: {snap}")
