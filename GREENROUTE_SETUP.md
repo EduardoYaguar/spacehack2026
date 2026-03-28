@@ -72,8 +72,7 @@ greenroute/
 
 ### app/agent/graph.py — Orquestador
 - Tipo: coordinador **Python puro**, sin LLM
-- Construye el `StateGraph` con los 4 nodos
-- Implementa el edge condicional `should_run_optimizer`
+- Construye el `StateGraph` con los 4 nodos en secuencia fija
 - Expone `run_greenroute()` como punto de entrada async
 
 ### app/agent/state.py — AgentState
@@ -82,15 +81,13 @@ Estado compartido TypedDict que fluye por todos los nodos:
 | Campo | Tipo | Descripción |
 |---|---|---|
 | `messages` | `List[BaseMessage]` | Historial LangGraph |
-| `corridor_id` | `str` | `"SGP_PKL"` |
-| `transport_modes` | `List[str]` | `["maritime"]` \| `["maritime", "aviation"]` |
-| `triggered_by` | `str` | `scheduler` \| `reroute_needed` \| `degradation_event` |
-| `current_cert_status` | `str` | `GREEN` \| `WARN` \| `RED` |
-| `last_score` | `float` | Último score registrado |
+| `corridor_id` | `str` | `"SGP_PKL"` \| `"PVG_DXB_AMS"` |
+| `transport_modes` | `List[str]` | `["maritime"]` \| `["aviation"]` |
+| `triggered_by` | `str` | `scheduler` \| `new_data` \| `voyage_completed` |
+| `vehicle_track` | `dict \| None` | Track real del vehículo (AIS/ADS-B) |
 | `satellite_report` | `dict \| None` | Output del SatelliteAnalyst |
-| `cert_decision` | `dict \| None` | Output del CertificationJudge |
 | `route_recommendation` | `dict \| None` | Output del CorridorOptimizer |
-| `run_optimizer` | `bool` | Flag que decide si se invoca el optimizer |
+| `cert_decision` | `dict \| None` | Output del CertificationJudge |
 | `final_decision` | `dict \| None` | GreenRouteDecision JSON final |
 | `pushed_to_firebase` | `bool` | Confirmación de sync con Firebase |
 
@@ -99,22 +96,23 @@ Estado compartido TypedDict que fluye por todos los nodos:
 - Loop ReAct · máximo **5 tool calls**
 - Siempre se ejecuta primero
 - Tools disponibles: `query_gee_no2`, `query_era5_wind`, `query_viirs_ships`, `query_so2_hotspots`
-- Output escrito en `state["satellite_report"]`
+- Output escrito en `state["satellite_report"]` — incluye `grid_path`
 
-### app/agent/nodes/certification_judge.py — Agente 2
-- Modelo: `claude-haiku-4-5`
-- Loop ReAct · máximo **4 tool calls**
-- Siempre se ejecuta después del SatelliteAnalyst
-- Tools disponibles: `check_baseline_history`, `detect_meteorological_confound`
-- Decide el valor de `state["run_optimizer"]`
-- Output escrito en `state["cert_decision"]`
-
-### app/agent/nodes/corridor_optimizer.py — Agente 3
+### app/agent/nodes/corridor_optimizer.py — Agente 2 en el flujo
 - Modelo: `claude-haiku-4-5`
 - Loop ReAct + NetworkX · máximo **5 tool calls**
-- Solo se ejecuta si `should_run_optimizer` retorna `"run_optimizer"`
-- Tools disponibles: `build_graph`, `run_astar`, `compute_co2_edge_weights`
+- Siempre se ejecuta después del SatelliteAnalyst
+- Lee `state["satellite_report"]["grid_path"]` para construir el grafo
+- Tools disponibles: `build_graph`, `run_astar`, `score_path`
 - Output escrito en `state["route_recommendation"]`
+
+### app/agent/nodes/certification_judge.py — Agente 3 en el flujo
+- Modelo: `claude-haiku-4-5`
+- Loop ReAct · máximo **4 tool calls**
+- Siempre se ejecuta después del CorridorOptimizer
+- Certifica el **vehículo** que siguió la ruta recomendada, no el corredor
+- Tools disponibles: `check_track_compliance`, `verify_waypoint_passage`
+- Output escrito en `state["cert_decision"]`
 
 ### app/agent/nodes/synthesize.py — Nodo final
 - **Python puro, sin LLM**
@@ -133,15 +131,15 @@ Estado compartido TypedDict que fluye por todos los nodos:
 ### app/agent/tools/judge_tools.py
 | Tool | Propósito |
 |---|---|
-| `check_baseline_history` | Z-score NO2 actual vs media estacional de baselines.json |
-| `detect_meteorological_confound` | Verifica fuegos FIRMS + vientos ERA5 para descartar confounds |
+| `check_track_compliance` | Compara track AIS/ADS-B contra ruta óptima, calcula desviación |
+| `verify_waypoint_passage` | Confirma que el vehículo pasó por los waypoints obligatorios |
 
 ### app/agent/tools/optimizer_tools.py
 | Tool | Propósito |
 |---|---|
-| `build_graph` | Construye NetworkX DiGraph con 8-vecinos navegables |
+| `build_graph` | Construye NetworkX DiGraph con 8-vecinos navegables, modo-aware |
 | `run_astar` | A* con heurística haversine y waypoints forzados |
-| `compute_co2_edge_weights` | Convierte costo del path en score 0-100 y % ahorro CO2 |
+| `score_path` | Score 0-100 del path óptimo vs baseline geodésica recta |
 
 ### app/routers/corridor.py
 | Método | Ruta | Descripción |
@@ -168,44 +166,28 @@ START
 │      SatelliteAnalyst     │  ← siempre primero
 │   ReAct · max 5 calls     │
 └─────────────┬─────────────┘
-              │  satellite_report → AgentState
+              │  satellite_report (con grid_path) → AgentState
               ▼
 ┌───────────────────────────┐
-│     CertificationJudge    │  ← siempre segundo
-│   ReAct · max 4 calls     │
+│    CorridorOptimizer      │  ← siempre segundo
+│   ReAct · max 5 calls     │
 └─────────────┬─────────────┘
+              │  route_recommendation → AgentState
+              ▼
+┌───────────────────────────┐
+│    CertificationJudge     │  ← siempre tercero
+│   ReAct · max 4 calls     │  certifica el vehículo que siguió la ruta
+└─────────────┬─────────────┘
+              │  cert_decision → AgentState
+              ▼
+  ┌───────────────────────┐
+  │       synthesize      │  ← Python puro, sin LLM
+  │  GreenRouteDecision   │
+  │  + push Firebase      │
+  └───────────┬───────────┘
               │
-      ┌───────┴─────────────┐
-      │  should_run_         │  ← edge condicional Python puro
-      │  optimizer(state)?   │
-      └───────┬──────────────┘
-          SÍ  │  NO
-          │   └──────────────────────────┐
-          ▼                              ▼
-┌──────────────────────┐    ┌────────────────────────┐
-│  CorridorOptimizer   │    │    (skip optimizer)    │
-│  ReAct · max 5 calls │    └──────────┬─────────────┘
-└──────────┬───────────┘               │
-           └──────────────┬────────────┘
-                          ▼
-              ┌───────────────────────┐
-              │       synthesize      │  ← Python puro, sin LLM
-              │  GreenRouteDecision   │
-              │  + push Firebase      │
-              └───────────┬───────────┘
-                          │
-                         END
+             END
 ```
-
-### Regla de activación del CorridorOptimizer
-
-| Condición | ¿Corre optimizer? |
-|---|---|
-| `triggered_by = "reroute_needed"` | ✅ Siempre SÍ |
-| `triggered_by = "degradation_event"` | ✅ SÍ |
-| `cert_decision = "RED"` | ✅ SÍ |
-| `cert_decision = "WARN"` | ✅ SÍ |
-| `cert_decision = "GREEN"` y `trigger = "scheduler"` | ❌ NO |
 
 ---
 
@@ -358,7 +340,7 @@ curl http://localhost:8000/health/ping
 http://localhost:8000/docs
 ```
 
-### Test trigger scheduler (flujo corto — sin optimizer)
+### Test — nuevos datos satelitales (recalcular ruta óptima)
 
 ```bash
 curl -X POST http://localhost:8000/corridor/run \
@@ -366,23 +348,24 @@ curl -X POST http://localhost:8000/corridor/run \
   -d '{
     "corridor_id": "SGP_PKL",
     "transport_modes": ["maritime"],
-    "triggered_by": "scheduler",
-    "current_cert_status": "GREEN",
-    "last_score": 68.2
+    "triggered_by": "new_data"
   }'
 ```
 
-### Test trigger reroute_needed (flujo largo — con optimizer)
+### Test — viaje completado (certificar vehículo)
 
 ```bash
 curl -X POST http://localhost:8000/corridor/run \
   -H "Content-Type: application/json" \
   -d '{
     "corridor_id": "SGP_PKL",
-    "transport_modes": ["maritime", "aviation"],
-    "triggered_by": "reroute_needed",
-    "current_cert_status": "WARN",
-    "last_score": 52.1
+    "transport_modes": ["maritime"],
+    "triggered_by": "voyage_completed",
+    "vehicle_track": {
+      "vehicle_id": "IMO9876543",
+      "voyage_id": "SGP_PKL_20260327_001",
+      "ais_points": []
+    }
   }'
 ```
 

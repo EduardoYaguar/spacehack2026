@@ -7,9 +7,9 @@
 
 ## 1. Visión general del sistema
 
-GreenRoute es un sistema multi-agente autónomo de ciclo cerrado. Consume datos satelitales reales de Google Earth Engine, analiza el corredor SGP_PKL, emite una certificación de carbono (GREEN / WARN / RED) y, cuando es necesario, calcula la ruta alternativa de menor emisión usando A* sobre una grilla de 40×50 celdas.
+GreenRoute es un sistema multi-agente autónomo de ciclo cerrado. Consume datos satelitales reales de Google Earth Engine, calcula la ruta de menor impacto ambiental para un corredor (marítimo o aéreo) usando A*, y certifica los buques/aeronaves que efectivamente siguen esa ruta recomendada.
 
-El orquestador no es un LLM. Es un coordinador Python puro implementado con LangGraph (StateGraph) que decide qué agentes invocar, en qué orden, y con qué inputs, según el trigger y los resultados intermedios.
+El orquestador no es un LLM. Es un coordinador Python puro implementado con LangGraph (StateGraph) que secuencia los tres agentes y sintetiza el output final.
 
 ---
 
@@ -30,23 +30,23 @@ El orquestador no es un LLM. Es un coordinador Python puro implementado con Lang
 - Output: SatelliteReport JSON
 - Siempre se ejecuta primero, sin excepción
 
-### 2.3 CertificationJudge (Agente 2)
-
-- Tipo: Agente LLM con loop ReAct
-- Modelo: claude-haiku-4-5
-- Responsabilidad: emitir certificación GREEN / WARN / RED considerando contexto meteorológico
-- Input: SatelliteReport del agente anterior + baselines.json
-- Output: CertDecision JSON
-- Siempre se ejecuta después del SatelliteAnalyst
-
-### 2.4 CorridorOptimizer (Agente 3)
+### 2.3 CorridorOptimizer (Agente 2 en el flujo, implementado como Agente 3)
 
 - Tipo: Agente LLM con loop ReAct + NetworkX
 - Modelo: claude-haiku-4-5
-- Responsabilidad: calcular la ruta de menor carbono mediante A* sobre la grilla satelital
-- Input: SatelliteReport + decisión del CertificationJudge
+- Responsabilidad: calcular la ruta de menor impacto ambiental mediante A* sobre la grilla satelital
+- Input: SatelliteReport del agente anterior (incluye grid_path)
 - Output: RouteRecommendation JSON
-- Solo se ejecuta bajo condiciones específicas (ver sección 4)
+- Siempre se ejecuta — la ruta debe existir antes de que alguien pueda ser certificado por seguirla
+
+### 2.4 CertificationJudge (Agente 3 en el flujo, implementado como Agente 2)
+
+- Tipo: Agente LLM con loop ReAct
+- Modelo: claude-haiku-4-5
+- Responsabilidad: certificar los buques/aeronaves que efectivamente siguieron la ruta recomendada por el CorridorOptimizer
+- Input: SatelliteReport + RouteRecommendation + datos de track real del vehículo (AIS/ADS-B)
+- Output: CertDecision JSON (certificado verde por viaje)
+- Siempre se ejecuta después del CorridorOptimizer
 
 ---
 
@@ -59,20 +59,15 @@ AgentState
 ├── messages              List[BaseMessage]   — historial LangGraph
 │
 ├── INPUT del corredor
-│   ├── corridor_id       str                 — "SGP_PKL"
-│   ├── transport_modes   List[str]           — ["maritime"] | ["maritime", "aviation"]
-│   ├── triggered_by      str                 — scheduler | reroute_needed | degradation_event
-│   ├── current_cert_status str               — GREEN | WARN | RED
-│   └── last_score        float               — último score registrado
+│   ├── corridor_id       str                 — "SGP_PKL" | "PVG_DXB_AMS"
+│   ├── transport_modes   List[str]           — ["maritime"] | ["aviation"]
+│   ├── triggered_by      str                 — scheduler | new_data | voyage_completed
+│   └── vehicle_track     dict | None         — track real del vehículo (AIS/ADS-B)
 │
-├── RESULTADOS por agente
-│   ├── satellite_report  dict | None         — output de SatelliteAnalyst
-│   ├── cert_decision     dict | None         — output de CertificationJudge
-│   └── route_recommendation dict | None      — output de CorridorOptimizer
-│
-├── CONTROL de flujo
-│   ├── run_optimizer     bool                — el juez decide si invocar optimizer
-│   └── next_action       str | None
+├── RESULTADOS por agente (en orden de ejecución)
+│   ├── satellite_report      dict | None     — output del SatelliteAnalyst
+│   ├── route_recommendation  dict | None     — output del CorridorOptimizer
+│   └── cert_decision         dict | None     — output del CertificationJudge
 │
 └── OUTPUT final
     ├── final_decision    dict | None         — GreenRouteDecision JSON
@@ -93,54 +88,37 @@ START
 │    SatelliteAnalyst     │  ← siempre primero
 │  (ReAct · max 5 calls)  │
 └────────────┬────────────┘
-             │  satellite_report
+             │  satellite_report (incluye grid_path)
              ▼
 ┌─────────────────────────┐
-│   CertificationJudge    │  ← siempre segundo
-│  (ReAct · max 4 calls)  │
+│   CorridorOptimizer     │  ← siempre segundo
+│  (ReAct · max 5 calls)  │
 └────────────┬────────────┘
-             │
-     ┌───────┴────────┐
-     │  ¿run_optimizer?│
-     └───────┬────────┘
-         SI  │  NO
-         │   └────────────────────────┐
-         ▼                            ▼
-┌─────────────────────┐    ┌──────────────────────┐
-│  CorridorOptimizer  │    │  (skip optimizer)    │
-│ (ReAct · max 5 calls│    └──────────┬───────────┘
-└──────────┬──────────┘               │
-           │                          │
-           └──────────┬───────────────┘
-                      ▼
-          ┌───────────────────────┐
-          │      synthesize       │
-          │  (Python puro, no LLM)│
-          └───────────┬───────────┘
-                      │  final_decision JSON
-                      ▼
-                     END
+             │  route_recommendation (ruta óptima + baseline)
+             ▼
+┌─────────────────────────┐
+│   CertificationJudge    │  ← siempre tercero
+│  (ReAct · max 4 calls)  │  certifica el vehículo que siguió la ruta
+└────────────┬────────────┘
+             │  cert_decision
+             ▼
+┌───────────────────────┐
+│      synthesize       │  ← Python puro, sin LLM
+│  GreenRouteDecision   │
+│  + push Firebase      │
+└───────────┬───────────┘
+            │  final_decision JSON
+            ▼
+           END
 ```
 
-### 4.2 Regla de activación del CorridorOptimizer
+### 4.2 Triggers del sistema
 
-El nodo `should_run_optimizer` evalúa el estado tras CertificationJudge:
-
-| Condición | ¿Corre optimizer? |
+| Trigger | Descripción |
 |---|---|
-| triggered_by = "reroute_needed" | Siempre SÍ |
-| triggered_by = "degradation_event" | SÍ |
-| cert_decision = "RED" | SÍ |
-| cert_decision = "WARN" | SÍ |
-| cert_decision = "GREEN" y trigger = "scheduler" | NO |
-
-### 4.3 Triggers del sistema
-
-| Trigger | Descripción | Orden de agentes |
-|---|---|---|
-| scheduler | Ejecución periódica programada | Analyst → Judge → (Optimizer si WARN/RED) |
-| reroute_needed | Operador solicita ruta alternativa | Analyst → Judge → Optimizer (forzado) |
-| degradation_event | Degradación detectada en tiempo real | Analyst → Judge → Optimizer |
+| scheduler | Nuevos datos GEE disponibles — recalcular ruta óptima |
+| new_data | Snapshot satelital actualizado para el corredor |
+| voyage_completed | Un vehículo terminó su viaje — certificar si siguió la ruta |
 
 ---
 
@@ -197,97 +175,33 @@ Reglas de uso de tools en orden:
 
 ---
 
-### 5.2 CertificationJudge
-
-**Loop ReAct — máximo 4 tool calls**
-
-Reglas críticas en orden estricto:
-
-1. Siempre llamar `check_baseline_history` antes de decidir
-2. Si z-score > 2.0 → DEBE llamar `detect_meteorological_confound`
-3. Razonar sobre confounds específicos de Singapore:
-   - Monzón SW (jun-sep): NO2 elevado por estancamiento atmosférico
-   - Fuegos de turba en Sumatra (jun-oct): humo transfronterizo, NO son barcos
-   - Paso de la ITCZ: concentración de emisiones
-4. VIIRS es promedio mensual — tráfico alto ≠ emergencia
-5. SO2 cerca de Jurong Island puede ser industrial, no barcos
-
-**Umbrales de decisión:**
-
-| Certificación | Condición |
-|---|---|
-| GREEN | score >= 65 Y tendencia estable o mejorando |
-| WARN | score entre 45-64, O score >= 65 con tendencia negativa > 0.5/día |
-| RED | score < 45, O 3+ WARNs consecutivos |
-
-**Tools:**
-
-| Tool | Propósito |
-|---|---|
-| check_baseline_history | Computa z-score del NO2 actual vs media estacional de baselines.json |
-| detect_meteorological_confound | Verifica fuegos FIRMS + vientos ERA5 para descartar confounds |
-
-**Output — CertDecision:**
-
-```json
-{
-  "corridor_id": "SGP_PKL",
-  "decision_timestamp": "2026-03-27T14:10:00Z",
-  "decision": "GREEN",
-  "confidence_pct": 84,
-  "primary_driver": "NO2 dentro de norma estacional, viento favorable 61%",
-  "is_met_confound": false,
-  "confound_type": null,
-  "badge_text": "Corredor certificado verde. NO2 en norma, SO2 en cumplimiento ECA.",
-  "next_review_hours": 48,
-  "reasoning_chain": ["..."]
-}
-```
-
----
-
-### 5.3 CorridorOptimizer
+### 5.2 CorridorOptimizer
 
 **Loop ReAct — máximo 5 tool calls**
 
 Reglas:
 
-1. Siempre llamar `build_graph` primero (construye el DiGraph de NetworkX)
-2. Luego llamar `run_astar` — el path DEBE pasar por Raffles Lighthouse y One Fathom Bank
-3. Si el path no incluye los waypoints → llamar `build_graph` de nuevo con forced_waypoints
-4. Llamar `compute_co2_edge_weights` para estimar ahorro vs ruta baseline
-5. Para aviación: correr A* separado con pesos WEIGHTS_AVIATION
+1. Siempre llamar `build_graph` primero (construye el DiGraph de NetworkX desde el grid_path del satellite_report)
+2. Luego llamar `run_astar` — el path DEBE pasar por todos los waypoints obligatorios del modo
+3. Si el path no incluye los waypoints → llamar `build_graph` de nuevo con forced_waypoints y repetir run_astar
+4. Llamar `score_path` para calcular green_score óptimo vs baseline (geodésica recta)
+5. Retornar RouteRecommendation JSON
 
-**Waypoints obligatorios (marítimo):**
+**Waypoints obligatorios:**
 
-| Waypoint | Coordenadas | Razón |
+| Modo | Waypoint | Coordenadas |
 |---|---|---|
-| Eastern Strait entry | 1.19°N, 104.10°E | Entrada de todos los barcos hacia el E |
-| Raffles Lighthouse TSS | 1.17°N, 103.45°E | Salida occidental del Estrecho |
-| One Fathom Bank | 2.92°N, 101.60°E | Aproximación al Estrecho de Malaca |
-
-**Pesos de aristas:**
-
-Marítimo:
-
-```
-no2=0.30 · so2=0.10 · wind=0.20 · wave=0.15 · viirs=0.15 · dist=0.10
-```
-
-Aviación:
-
-```
-no2=0.45 · so2=0.15 · wind=0.30 · dist=0.10
-(wave y viirs no aplican)
-```
+| Maritime | One Fathom Bank | 2.92°N, 101.60°E |
+| Maritime | Raffles Lighthouse TSS | 1.17°N, 103.45°E |
+| Aviation | Dubai Intl (DXB) | 25.25°N, 55.36°E |
 
 **Tools:**
 
 | Tool | Propósito |
 |---|---|
-| build_graph | Construye NetworkX DiGraph con 8-vecinos navegables |
-| run_astar | A* con heurística haversine, waypoints forzados |
-| compute_co2_edge_weights | Convierte costo del path en score 0-100 y % ahorro CO2 |
+| build_graph | Construye NetworkX DiGraph con 8-vecinos navegables, modo-aware |
+| run_astar | A* con heurística haversine y waypoints forzados |
+| score_path | Score 0-100 del path óptimo vs baseline geodésica recta |
 
 **Output — RouteRecommendation:**
 
@@ -296,13 +210,56 @@ no2=0.45 · so2=0.15 · wind=0.30 · dist=0.10
   "corridor_id": "SGP_PKL",
   "optimization_timestamp": "2026-03-27T14:15:00Z",
   "transport_mode": "maritime",
-  "optimal_path_score": 74.8,
-  "co2_saving_pct": 15.7,
-  "optimal_path_cells": 41,
-  "optimal_path_distance_km": 368,
-  "chokepoints_on_path": ["Raffles Lighthouse TSS", "One Fathom Bank"],
+  "optimal_green_score": 64.8,
+  "baseline_green_score": 67.8,
+  "green_score_vs_baseline_pct": -4.4,
+  "optimal_path_cells": 33,
+  "optimal_path_distance_km": 456.9,
+  "baseline_path_cells": 28,
+  "chokepoints_on_path": ["One Fathom Bank", "Raffles Lighthouse TSS"],
   "feasibility_flag": true,
-  "optimizer_notes": "Path óptimo añade 4.8% distancia pero evita 3 celdas con SO2 alto."
+  "optimizer_notes": "All waypoints hit. A* path slightly lower score than straight line due to waypoint constraints."
+}
+```
+
+---
+
+### 5.3 CertificationJudge
+
+**Loop ReAct — máximo 4 tool calls**
+
+El CertificationJudge certifica **vehículos individuales** (buques, aeronaves) que completaron un viaje siguiendo la ruta recomendada por el CorridorOptimizer. No certifica el corredor en abstracto — certifica el cumplimiento por viaje.
+
+Reglas:
+
+1. Comparar el track real del vehículo (AIS para barcos, ADS-B para aviones) contra `route_recommendation.optimal_path_cells`
+2. Calcular desviación media del track vs ruta óptima
+3. Verificar que el vehículo pasó por los waypoints obligatorios
+4. Considerar el green_score del corredor en el momento del viaje
+5. Emitir certificado GREEN si la desviación es aceptable y los waypoints fueron respetados
+
+**Tools:**
+
+| Tool | Propósito |
+|---|---|
+| check_track_compliance | Compara track AIS/ADS-B contra ruta óptima, calcula desviación |
+| verify_waypoint_passage | Confirma que el vehículo pasó por los waypoints obligatorios |
+
+**Output — CertDecision:**
+
+```json
+{
+  "corridor_id": "SGP_PKL",
+  "vehicle_id": "IMO9876543",
+  "voyage_id": "SGP_PKL_20260327_001",
+  "decision_timestamp": "2026-03-27T22:00:00Z",
+  "certificate": "GREEN",
+  "confidence_pct": 91,
+  "track_compliance_pct": 87.3,
+  "waypoints_confirmed": ["One Fathom Bank", "Raffles Lighthouse TSS"],
+  "green_score_during_voyage": 64.8,
+  "badge_text": "Voyage certified GREEN. Track within compliance threshold. All waypoints confirmed.",
+  "reasoning_chain": ["..."]
 }
 ```
 
